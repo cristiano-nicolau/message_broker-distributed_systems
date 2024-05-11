@@ -3,8 +3,8 @@ from collections.abc import Callable
 from enum import Enum
 from queue import LifoQueue, Empty
 from typing import Any
-
-import socket, json, pickle, selectors
+import socket
+import json, pickle, selectors
 import xml.etree.ElementTree as ET
 
 class MiddlewareType(Enum):
@@ -14,74 +14,84 @@ class MiddlewareType(Enum):
     PRODUCER = 2
 
 
-
 class Queue:
     """Representation of Queue interface for both Consumers and Producers."""
 
     def __init__(self, topic, _type=MiddlewareType.CONSUMER):
         """Create Queue."""
+        self.host = "localhost"
+        self.port = 5000
         self.topic = topic
         self._type = _type
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect(('localhost', 5000))
-        self.sele = selectors.DefaultSelector()
-        self.sele.register(self.sock, selectors.EVENT_READ, self.pull)
+        self.sock.connect((self.host, self.port))
+        
+    def encode(self, type, topic , message ):
+        """Encode data."""
+        pass    
 
-    def send_msg(self, method, topic, value):
-        """Send data to broker."""
-        msg = self.encode(method, topic, value)
-        self.sock.send(len(msg).to_bytes(2, 'big') + msg)
+    def decode(self, data):
+        """Decode data."""
+        pass
 
     def push(self, value):
-        """Sends data to broker."""
-        self.send_msg("PUBLISH", self.topic, value)
+        """sends data to broker."""
+        data = self.encode("publish", topic=str(self.topic), msg=value)
+        self.sock.send(len(data).to_bytes(2, 'big') + data)
 
     def pull(self) -> (str, Any):
         """Receives (topic, data) from broker.
-        Should BLOCK the consumer!"""
-        header = self.sock.recv(2)
-        length = int.from_bytes(header, 'big')
-        data = self.sock.recv(length)
 
-        if data:
-            topic, value = self.decode(data)
-            return topic, value
-        else:
-            return None, None
+        Should BLOCK the consumer!"""
+
+        data = self.sock.recv(2)
+        header = int.from_bytes(data, 'big')
+        data = self.sock.recv(header)
+        
+        if data != b"":
+            data = self.decode(data)
+            print(data)
+            return data["topic"], data["msg"]
 
     def list_topics(self, callback: Callable):
         """Lists all topics available in the broker."""
-        self.send_msg("LIST_TOPICS", self.topic, "")
+
+        data = self.encode("list_topics")
+        self.sock.send(len(data).to_bytes(2, 'big') + data)
 
     def cancel(self):
         """Cancel subscription."""
-        self.send_msg("CANCEL", self.topic, "")
+        data = self.encode("unsubscribe", topic=str(self.topic))
+        self.sock.send(len(data).to_bytes(2, 'big') + data)
+
 
 
 class JSONQueue(Queue):
     """Queue implementation with JSON based serialization."""
-
+    
     def __init__(self, topic, _type=MiddlewareType.CONSUMER):
-        super().__init__(topic, _type)
-        msg = json.dumps({"method": "serialize", "value": "JSON"}).encode("utf-8")
-        self.sock.send(len(msg).to_bytes(2, 'big') + msg)
+        super().__init__(topic, _type)  
+        msg ='{"type" : "serialization", "msg" : "json"}'
+        self.sock.send(len(msg).to_bytes(2, 'big') + bytes(msg,"utf-8"))
 
         if self._type == MiddlewareType.CONSUMER:
-            msg = self.encode("SUBSCRIBE", self.topic, "")
+            msg = self.encode("subscribe", topic=str(self.topic))
             self.sock.send(len(msg).to_bytes(2, 'big') + msg)
 
-    def encode(self, method, topic, value):
-        """Encode data to JSON."""
-        msg = json.dumps({"method": method, "topic": topic, "value": value}).encode("utf-8")
-        return msg
-
+        
+    def encode(self, type, topic = None, msg=None):
+        if topic is not None and msg is not None:
+            data = {"type": type, "topic": topic, "msg": msg}
+        elif topic is not None:
+            data = {"type": type, "topic": topic}
+        elif msg is not None:
+            data = {"type": type, "msg": msg}
+        else:
+            data = {"type": type}
+        return (json.dumps(data).encode('utf-8'))
+    
     def decode(self, data):
-        """Decode data from JSON."""
-        msg = json.loads(data.decode("utf-8"))
-        method = msg["method"]
-        topic = msg.get("topic")
-        value = msg.get("value")
-        return topic, value
+        return json.loads(data.decode('utf-8'))
 
 
 class XMLQueue(Queue):
@@ -89,57 +99,56 @@ class XMLQueue(Queue):
 
     def __init__(self, topic, _type=MiddlewareType.CONSUMER):
         super().__init__(topic, _type)
-        msg = {"method": "serialize", "value": "XML"}
-        msg = ('<?xml version="1.0"?><data method="%(method)s"><value>%(value)s</value></data>' % msg)
-        msg = msg.encode('utf-8')
-        self.sock.send(len(msg).to_bytes(2, 'big') + msg)
+
+        msg = '{"type" : "serialization", "msg" : "xml"}'
+        self.sock.send(len(msg).to_bytes(2, 'big') + bytes(msg,"utf-8"))
 
         if self._type == MiddlewareType.CONSUMER:
-            msg = self.encode("SUBSCRIBE", self.topic, "")
+            msg = self.encode("subscribe", topic=str(self.topic))
             self.sock.send(len(msg).to_bytes(2, 'big') + msg)
 
-    def encode(self, method, topic, value):
-        """Encode data to XML."""
-        msg = {"method": method, "topic": topic, "value": value}
-        msg = ('<?xml version="1.0"?><data method="%(method)s" topic="%(topic)s"><value>%(value)s</value></data>' % msg)
-        msg = msg.encode('utf-8')
-        return msg
-
+    def encode(self,type, topic = None, msg=None):
+        if (topic and msg) is not None:
+            data = "<data><type>"+str(type)+"</type><topic>"+str(topic)+"</topic><msg>"+str(msg)+"</msg></data>"
+        elif topic is not None:
+            data = "<data><type>"+str(type)+"</type><topic>"+str(topic)+"</topic></data>"
+        elif msg is not None:
+            data = "<data><type>"+str(type)+"</type><msg>"+str(msg)+"</msg></data>"
+        else:
+            data = "<data><type>"+str(type)+"</type></data>"
+        return data.encode('utf-8')
+    
     def decode(self, data):
-        """Decode data from XML."""
-        root = ET.fromstring(data.decode("utf-8"))
-        msg = {}
+            tree = ET.ElementTree(ET.fromstring(data.decode("utf-8")))    
+            data = {}
+            
+            for el in tree.iter():
+                data[el.tag] = el.text
 
-        for el in root.iter():
-            msg[el.tag] = el.text
-
-        method = msg["method"]
-        topic = msg.get("topic")
-        value = msg.get("value")
-        return topic, value
-
-
+            return data
 class PickleQueue(Queue):
     """Queue implementation with Pickle based serialization."""
 
     def __init__(self, topic, _type=MiddlewareType.CONSUMER):
         super().__init__(topic, _type)
-        msg = pickle.dumps({"method": "serialize", "value": "PICKLE"})
-        self.sock.send(len(msg).to_bytes(2, 'big') + msg)
+
+        msg = '{"type" : "serialization", "msg" : "pickle"}'
+        self.sock.send(len(msg).to_bytes(2, 'big') + bytes(msg,"utf-8"))
 
         if self._type == MiddlewareType.CONSUMER:
-            msg = self.encode("SUBSCRIBE", self.topic, "")
+            msg = self.encode("subscribe", topic=str(self.topic))
             self.sock.send(len(msg).to_bytes(2, 'big') + msg)
 
-    def encode(self, method, topic, value):
-        """Encode data to Pickle."""
-        msg = pickle.dumps({"method": method, "topic": topic, "value": value})
-        return msg
-
+    def encode(self, type, topic = None, msg=None):
+        if topic is not None and msg is not None:
+            data = {"type": type, "topic": topic, "msg": msg}
+        elif topic is not None:
+            data = {"type": type, "topic": topic}
+        elif msg is not None:
+            data = {"type": type, "msg": msg}
+        else:
+            data = {"type": type}
+        return pickle.dumps(data)
+    
     def decode(self, data):
-        """Decode data from Pickle."""
-        msg = pickle.loads(data)
-        method = msg["method"]
-        topic = msg.get("topic")
-        value = msg.get("value")
-        return topic, value
+        return pickle.loads(data)

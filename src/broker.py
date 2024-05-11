@@ -1,8 +1,8 @@
 """Message Broker"""
 import enum
+import socket
 from typing import Dict, List, Any, Tuple
-
-import socket, json, pickle, selectors
+import socket, selectors, sys, json, pickle
 import xml.etree.ElementTree as ET
 
 class Serializer(enum.Enum):
@@ -19,167 +19,165 @@ class Broker:
     def __init__(self):
         """Initialize broker."""
         self.canceled = False
-        self.topics = {}
-        self.subscribers = {}
-        self.sockets = {}
+        self._host = "localhost"
+        self._port = 5000
+        self.sel = selectors.DefaultSelector()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind((self._host, self._port))
+        self.sock.listen(10)
+        self.sel.register(self.sock, selectors.EVENT_READ, self.accept)
 
-    def list_topics(self) -> List[str]:
-        """Returns a list of strings containing all topics containing values."""
-        return [topic for topic, messages in self.topics.items() if messages]
+        self.connections = {} # {socket : serialization}
+        self.topics = {} # {topic : [values]}
+        self.sub = {} # {(socket, serialization) : [topics]}
 
-    def get_topic(self, topic: str):
-        """Returns the currently stored value in topic."""
-        if topic in self.topics and self.topics[topic]:
-            return self.topics[topic][-1]
-        return None
+    def accept(self, sock, mask):
+        """Accept new connection."""
+        conn, addr = sock.accept()
+        self.sel.register(conn, selectors.EVENT_READ, self.read)
 
-    def put_topic(self, topic: str, value: Any):
-        """Store in topic the value."""
-        if topic not in self.topics:
-            self.topics[topic] = [value]
-        else:
-            self.topics[topic].append(value)
-
-    def list_subscriptions(self, topic: str) -> List[Tuple[socket.socket, Serializer]]:
-        """Provide list of subscribers to a given topic."""
-        return [subscriber for subscriber, topics in self.subscribers.items() if topic in topics]
-
-    def subscribe(self, topic: str, address: socket.socket, _format: Serializer = None):
-        """Subscribe to topic by client in address."""
-        if (address, _format) not in self.subscribers:
-            self.subscribers[(address, _format)] = [topic]
-        elif topic not in self.subscribers[(address, _format)]:
-            self.subscribers[(address, _format)].append(topic)
-
-    def unsubscribe(self, topic: str, address: socket.socket):
-        """Unsubscribe to topic by client in address."""
-        if (address, _format) in self.subscribers and topic in self.subscribers[(address, _format)]:
-            self.subscribers[(address, _format)].remove(topic)
-
-    def encode(self, method: str, topic: str, value: Any, serialize: Serializer):
-        """Encode data to be sent."""
-        if serialize == Serializer.JSON:
-            if topic is None:
-                msg = json.dumps({"method": method, "value": value}).encode("utf-8")
-            else:
-                msg = json.dumps({"method": method, "topic": topic, "value": value}).encode("utf-8")
-            return msg
-
-        elif serialize == Serializer.XML:
-            msg = {"method": method, "topic": topic, "value": value}
-            if topic is None:
-                msg = ('<?xml version="1.0"?><data method="%(method)s"><value>%(value)s</value></data>' % msg)
-            else:
-                msg = ('<?xml version="1.0"?><data method="%(method)s" topic="%(topic)s"><value>%(value)s</value></data>' % msg)
-            msg = msg.encode('utf-8')
-            return msg
-
-        elif serialize == Serializer.PICKLE:
-            if topic is None:
-                msg = pickle.dumps({"method": method, "value": value})
-            else:
-                msg = pickle.dumps({"method": method, "topic": topic, "value": value})
-            return msg
-
-    def decode(self, data: bytes, serialize: Serializer):
-        """Decode data received."""
-        if serialize == Serializer.JSON:
-            return json.loads(data.decode('utf-8'))
-        elif serialize == Serializer.XML:
-            root = ET.fromstring(data.decode('utf-8'))
-            msg = {}
-            for child in root:
-                msg[child.tag] = child.text
-            return msg
-        elif serialize == Serializer.PICKLE:
-            return pickle.loads(data)
-
-    def handle_publish(self, topic: str, value: Any, serialize: Serializer):
-        """Handle the PUBLISH method."""
-        self.put_topic(topic, value)
-        for subscriber, subscribed_topics in self.subscribers.items():
-            subscriber_socket, subscriber_format = subscriber
-            if topic in subscribed_topics:
-                msg = self.encode("PUBLISH_REP", topic, value, serialize)
-                subscriber_socket.send(len(msg).to_bytes(2, 'big') + msg)
-
-    def handle_subscribe(self, topic: str, conn: socket.socket, serialize: Serializer):
-        """Handle the SUBSCRIBE method."""
-        self.subscribe(topic, conn)
-        final_topic = self.get_topic(topic)
-        if final_topic is not None and topic is not None:
-            msg = self.encode("SUBSCRIBE_REP", topic, final_topic, serialize)
-            conn.send(len(msg).to_bytes(2, 'big') + msg)
-
-    def handle_cancel(self, topic: str, conn: socket.socket):
-        """Handle the CANCEL method."""
-        self.unsubscribe(topic, conn)
-
-    def handle_list_topics(self, topic: str, conn: socket.socket, serialize: Serializer):
-        """Handle the LIST_TOPICS method."""
-        topics = self.list_topics()
-        msg = self.encode("LIST_TOPICS_REP", topic, topics, serialize)
-        conn.send(len(msg).to_bytes(2, 'big') + msg)
-
-    def handle_request(self, conn: socket.socket, mask):
-        """Handle incoming requests."""
+    def read(self, conn, mask):
+        """Read data from connection."""
         header = conn.recv(2)
-        header = int.from_bytes(header, 'big')
-        length = conn.recv(header)
+        aux = int.from_bytes(header, "big")
+        body = conn.recv(aux)
 
-        if len(length) != 0:
-            if conn in self.sockets:
-                serialize = self.sockets[conn]
+        if body != b"":
+            if conn not in self.connections:
+                serialization = "json"
             else:
-                serialize = Serializer.JSON
-            data = self.decode(length, serialize)
+                serialization = self.connections[conn]
+
+            data = self.decode(body, serialization)
+            print(data)
+
         else:
             data = None
 
         if data is not None:
-            if conn not in self.sockets:
-                self.sockets[conn] = data["value"]
+            if conn not in self.connections:
+                print(data)
+                self.connections[conn] = data["msg"]
 
-            method = data["method"]
-            value = data.get("value")
-            topic = data.get("topic")
+            if data["type"] == "publish":
+                self.put_topic(data["topic"], data["msg"])
+                for connection, topics in self.sub.items():
+                    for tp in topics:
+                        if data["topic"].startswith(tp):
+                            try:
+                                response = self.encode("published", data["topic"], data["msg"], self.connections[connection[0]])
+                                connection[0].send(len(response).to_bytes(2, byteorder='big') + response)
+                            except:
+                                pass
 
-            if method == "PUBLISH":
-                self.handle_publish(topic, value, serialize)
-            elif method == "SUBSCRIBE":
-                self.handle_subscribe(topic, conn, serialize)
-            elif method == "CANCEL":
-                self.handle_cancel(topic, conn)
-            elif method == "LIST_TOPICS":
-                self.handle_list_topics(topic, conn, serialize)
+            elif data["type"] == "subscribe":
+                if data["topic"] is not None:
+                    self.subscribe(data["topic"], conn)
+                    last_value = self.get_topic(data["topic"])
+                    if last_value != None:
+                        response = self.encode("subscribed", data["topic"], last_value, self.connections[conn])
+                        conn.send(len(response).to_bytes(2, byteorder='big') + response)
+
+            elif data["type"] == "unsubscribe":
+                self.unsubscribe(data["topic"], conn)
+                response = self.encode("unsubscribed", data["topic"], None, self.connections[conn])
+                conn.send(len(response).to_bytes(2, byteorder='big') + response)
+
+            elif data["type"] == "list_topics":
+                topics = str(self.list_topics())
+                response = self.encode("topics", None, topics, self.connections[conn])
+                conn.send(len(response).to_bytes(2, byteorder='big') + response)
+
         else:
-            print("Closing connection", conn)
-            self.sockets.pop(conn)
-            self.subscribers = {subscriber: topics for subscriber, topics in self.subscribers.items() if
-                                subscriber[0] != conn}
+            self.sel.unregister(conn)
+            conn.close()
+            print("Connection closed")
+                
+    def list_topics(self) -> List[str]:
+        """Returns a list of strings containing all topics containing values."""
+        return [key for key in self.topics]
+
+    def get_topic(self, topic):
+        """Returns the currently stored value in topic."""
+        for tp in self.topics:
+            if topic in tp:
+                if len(self.topics[tp]) > 0:
+                    return self.topics[tp][-1]
+        return None
+            
+    def put_topic(self, topic, value):
+        """Store in topic the value."""
+        if topic in self.topics:
+            self.topics[topic].append(value)
+        else:
+            self.topics[topic] = [value]
+
+    def list_subscriptions(self, topic: str) -> List[Tuple[socket.socket, Serializer]]:
+        """Provide list of subscribers to a given topic."""
+        return [key for key, topics in self.sub.items() if topic in topics]
+
+    def subscribe(self, topic: str, address: socket.socket, _format: Serializer = None):
+        """Subscribe to topic by client in address."""
+        if (address, _format) not in self.sub:
+            self.sub[(address, _format)] = [topic]
+        elif topic not in self.sub[(address, _format)]:
+            self.sub[(address, _format)].append(topic)
+
+    def unsubscribe(self, topic, address):
+        """Unsubscribe to topic by client in address."""
+        for sub in self.sub:
+            if address in sub and topic in self.sub[sub]:
+                self.sub[sub].remove(topic)
+
+            
+    def encode(self, type, topic, message, serialization):
+        """Encode data using serialization."""
+        if serialization == "xml":
+            if topic is None:
+                data = "<data><type>"+str(type)+"</type><msg>"+str(message)+"</msg></data>"
+            else:
+                data = "<data><type>"+str(type)+"</type><topic>"+str(topic)+"</topic><msg>"+str(message)+"</msg></data>"
+            return data.encode("utf-8")
+        else:
+            if topic is None:
+                data = {"type" : type, "msg" : message}
+            else:
+                data = {"type" : type, "topic" : topic, "msg" : message}
+            
+            if serialization == "json":
+                return json.dumps(data).encode('utf-8')
+            elif serialization == "pickle":
+                return pickle.dumps(data)
+        
+    def decode(self, data, serialization):
+        """Decode data using serialization."""
+        if serialization == "json":
+            return json.loads(data.decode('utf-8'))
+        elif serialization == "pickle":
+            return pickle.loads(data)
+        elif serialization == "xml":
+            tree = ET.ElementTree(ET.fromstring(data.decode("utf-8")))    
+            data = {}
+            
+            for el in tree.iter():
+                data[el.tag] = el.text
+
+            return data
+    
 
     def run(self):
         """Run until canceled."""
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.bind(("localhost", 5000))
-        self.sock.listen()
-
-        self.sockets = {self.sock: Serializer.JSON}
 
         while not self.canceled:
-            connections = [self.sock] + list(self.sockets.keys())
-            r, w, x = select.select(connections, [], [])
-            for conn in r:
-                if conn == self.sock:
-                    client, address = self.sock.accept()
-                    client.setblocking(False)
-                    self.sockets[client] = Serializer.JSON
-                else:
-                    self.handle_request(conn, None)
-
-            for conn in x:
-                if conn in self.sockets:
-                    self.sockets.pop(conn)
-
-        self.sock.close()
-                
+            try:
+                events = self.sel.select()
+                for key, mask in events:
+                    callback = key.data
+                    callback(key.fileobj, mask)
+            except KeyboardInterrupt:
+                print("Closing server, please wait...")
+                self.canceled = True
+                sys.exit()
+            except socket.error:
+                print("Error in sockets, closing server")
+                sys.exit()
